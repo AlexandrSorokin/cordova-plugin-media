@@ -167,14 +167,21 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
         case NONE:
             this.audioFile = file;
             this.recorder = new MediaRecorder();
-             // support to record AAC with 44100 audio sampling
-            this.recorder.setAudioSamplingRate(44100);
-            this.recorder.setAudioEncodingBitRate(96000);
-             this.recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            this.recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-            this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-          //  this.recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS); // RAW_AMR);
-          //  this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC); //AMR_NB);
+            this.recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            // Ogg/Opus is available in MediaRecorder since Android 10, older versions keep AAC
+            if (file.toLowerCase().endsWith(".ogg") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                this.recorder.setOutputFormat(MediaRecorder.OutputFormat.OGG);
+                this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS);
+                this.recorder.setAudioChannels(1);
+                this.recorder.setAudioSamplingRate(16000);
+                this.recorder.setAudioEncodingBitRate(16000);
+            } else {
+                // support to record AAC with 44100 audio sampling
+                this.recorder.setAudioSamplingRate(44100);
+                this.recorder.setAudioEncodingBitRate(96000);
+                this.recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            }
             this.tempFile = createAudioFilePath(null);
             this.recorder.setOutputFile(this.tempFile);
             try {
