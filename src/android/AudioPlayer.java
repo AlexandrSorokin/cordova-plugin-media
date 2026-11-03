@@ -168,8 +168,8 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             this.audioFile = file;
             this.recorder = new MediaRecorder();
             this.recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            // Ogg/Opus is available in MediaRecorder since Android 10, older versions keep AAC
-            if (file.toLowerCase().endsWith(".ogg") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Ogg/Opus is available in MediaRecorder since Android 10, the app requires it as minSdkVersion
+            if (file.toLowerCase().endsWith(".ogg")) {
                 this.recorder.setOutputFormat(MediaRecorder.OutputFormat.OGG);
                 this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS);
                 this.recorder.setAudioChannels(1);
