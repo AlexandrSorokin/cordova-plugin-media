@@ -42,6 +42,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.LinkedList;
 
 /**
@@ -330,82 +333,93 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
     }
 
     /**
-     * MediaRecorder on real devices stores the start of the last packet as the Ogg page granule position
-     * instead of its end, so the first audio page has granule 0. RFC 7845 (4.5) treats such a stream as invalid
-     * and speech recognition rejects the file, so shift granule positions of all audio pages by the missing samples.
+     * MediaRecorder stores the codec timestamp as the Ogg page granule position. On some devices it is the start
+     * of the packet instead of its end, so the first audio page gets granule 0: RFC 7845 (4.5) treats such a stream
+     * as invalid and speech recognition rejects the file. Granule positions are recomputed from packet durations
+     * as RFC 7845 (4) requires, and the last page gets the end of stream flag that MediaRecorder never sets.
      */
-    private static void fixOggOpusGranulePositions(String path) {
-        try {
-            File file = new File(path);
-            byte[] data = Files.readAllBytes(file.toPath());
-            ByteBuffer page = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-            long shift = -1;
-            int pageIndex = 0;
-            int pos = 0;
-            // 0x5367674F is the "OggS" capture pattern
-            while (pos + 27 <= data.length && page.getInt(pos) == 0x5367674F) {
-                int segments = data[pos + 26] & 0xFF;
-                int bodyStart = pos + 27 + segments;
-                int end = bodyStart;
+    private static void fixOggOpus(String path) throws IOException {
+        Path file = Paths.get(path);
+        byte[] data = Files.readAllBytes(file);
+        ByteBuffer page = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        long granule = 0;
+        int packetLength = 0;
+        int toc = 0;
+        int frameCountByte = 0;
+        int lastPage = -1;
+        int lastPageEnd = 0;
+        int pageIndex = 0;
+        int pos = 0;
+        // 0x5367674F is the "OggS" capture pattern
+        while (pos + 27 <= data.length && page.getInt(pos) == 0x5367674F) {
+            int segments = data[pos + 26] & 0xFF;
+            int offset = pos + 27 + segments;
+            int end = offset;
+            for (int i = 0; i < segments; i++) {
+                end += data[pos + 27 + i] & 0xFF;
+            }
+            if (end > data.length) {
+                break;
+            }
+            // the first two pages hold OpusHead and OpusTags headers, audio starts from the third one
+            if (pageIndex >= 2) {
+                boolean packetCompleted = false;
                 for (int i = 0; i < segments; i++) {
-                    end += data[pos + 27 + i] & 0xFF;
-                }
-                if (end > data.length) {
-                    break;
-                }
-                // the first two pages hold OpusHead and OpusTags headers, audio starts from the third one
-                if (pageIndex >= 2) {
-                    long granule = page.getLong(pos + 6);
-                    if (shift < 0) {
-                        shift = Math.max(0, completedPacketsSamples(data, pos, segments, bodyStart) - granule);
-                        if (shift == 0) {
-                            return;
-                        }
+                    int lacing = data[pos + 27 + i] & 0xFF;
+                    // a packet longer than 254 bytes may continue on the next page, so its first bytes are kept until it completes
+                    if (packetLength == 0 && lacing > 0) {
+                        toc = data[offset] & 0xFF;
+                        frameCountByte = lacing > 1 ? data[offset + 1] & 0xFF : 0;
                     }
-                    page.putLong(pos + 6, granule + shift);
-                    page.putInt(pos + 22, 0);
-                    page.putInt(pos + 22, oggCrc(data, pos, end));
+                    packetLength += lacing;
+                    offset += lacing;
+                    if (lacing < 255) {
+                        granule += opusPacketSamples(toc, frameCountByte, packetLength);
+                        packetLength = 0;
+                        packetCompleted = true;
+                    }
                 }
-                pageIndex++;
-                pos = end;
+                // a page without a completed packet has granule -1 (RFC 3533, 6)
+                page.putLong(pos + 6, packetCompleted ? granule : -1);
+                updateOggCrc(page, data, pos, end);
+                lastPage = pos;
+                lastPageEnd = end;
             }
-            if (shift > 0) {
-                Files.write(file.toPath(), data);
-            }
-        } catch (Exception e) {
-            LOG.e(LOG_TAG, e.getLocalizedMessage(), e);
+            pageIndex++;
+            pos = end;
+        }
+        if (lastPage < 0) {
+            return;
+        }
+        data[lastPage + 5] |= 0x04;
+        updateOggCrc(page, data, lastPage, lastPageEnd);
+        // writing next to the recording and renaming keeps it intact if writing fails
+        Path tmp = Paths.get(path + ".tmp");
+        try {
+            Files.write(tmp, data);
+            Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(tmp);
         }
     }
 
-    // Duration of packets completed on the page in 48 kHz samples
-    private static long completedPacketsSamples(byte[] data, int pos, int segments, int bodyStart) {
-        long samples = 0;
-        int packetStart = bodyStart;
-        int offset = bodyStart;
-        for (int i = 0; i < segments; i++) {
-            int lacing = data[pos + 27 + i] & 0xFF;
-            offset += lacing;
-            if (lacing < 255) {
-                samples += opusPacketSamples(data, packetStart, offset - packetStart);
-                packetStart = offset;
-            }
-        }
-        return samples;
-    }
-
-    // Opus packet duration in 48 kHz samples by its TOC byte (RFC 6716, 3.1)
-    private static int opusPacketSamples(byte[] data, int offset, int length) {
+    // Opus packet duration in 48 kHz samples by its TOC byte and, for code 3, the frame count byte (RFC 6716, 3.1)
+    private static int opusPacketSamples(int toc, int frameCountByte, int length) {
         if (length == 0) {
             return 0;
         }
-        int toc = data[offset] & 0xFF;
         int config = toc >> 3;
         int frameSamples = config < 12 ? new int[] {480, 960, 1920, 2880}[config & 3] // SILK: 10, 20, 40, 60 ms
             : config < 16 ? 480 << (config & 1)                                         // Hybrid: 10, 20 ms
             : 120 << (config & 3);                                                      // CELT: 2.5, 5, 10, 20 ms
         int code = toc & 3;
-        int frames = code == 0 ? 1 : code < 3 ? 2 : (length > 1 ? data[offset + 1] & 0x3F : 0);
+        int frames = code == 0 ? 1 : code < 3 ? 2 : (length > 1 ? frameCountByte & 0x3F : 0);
         return frameSamples * frames;
+    }
+
+    private static void updateOggCrc(ByteBuffer page, byte[] data, int from, int to) {
+        page.putInt(from + 22, 0);
+        page.putInt(from + 22, oggCrc(data, from, to));
     }
 
     // Ogg page checksum: CRC-32 with polynomial 0x04C11DB7 without bit reflection, so java.util.zip.CRC32 does not fit
@@ -433,7 +447,13 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
                 if (stop) {
                     LOG.d(LOG_TAG, "stopping recording");
                     if (this.audioFile.toLowerCase().endsWith(".ogg")) {
-                        fixOggOpusGranulePositions(this.tempFile);
+                        try {
+                            fixOggOpus(this.tempFile);
+                        } catch (Exception e) {
+                            // the recording is kept as is: it plays, but speech recognition may reject it
+                            LOG.e(LOG_TAG, e.getLocalizedMessage(), e);
+                            sendErrorStatus(MEDIA_ERR_ABORTED, "Unable to fix Ogg Opus file: " + e.getLocalizedMessage());
+                        }
                     }
                     this.setState(STATE.MEDIA_STOPPED);
                     this.moveFile(this.audioFile);
